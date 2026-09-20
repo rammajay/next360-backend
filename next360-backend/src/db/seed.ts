@@ -1,4 +1,4 @@
-
+import "dotenv/config";
 
 import { pool, initSchema } from "./index";
 import { genId } from "../utils";
