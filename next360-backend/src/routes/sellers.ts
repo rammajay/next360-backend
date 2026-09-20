@@ -1,122 +1,63 @@
 import { Router } from "express";
 import multer from "multer";
-import path from "path";
-import fs from "fs";
-import { db } from "../db";
-import { genId, calcCommission } from "../utils";
+import { put } from "@vercel/blob";
+import { pool } from "../db";
 import { requireAuth, requireRole, AuthedRequest } from "../middleware/auth";
 
 const router = Router();
+const upload = multer({ storage: multer.memoryStorage() });
 
-const UPLOAD_DIR = path.join(__dirname, "..", "..", "uploads", "kyc");
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
-    filename: (_req, file, cb) => cb(null, `${genId("kyc")}${path.extname(file.originalname)}`),
-  }),
-});
-
-// ---------- POST /register-seller ----------
-// PRD 4.2 onboarding: register (already done via /login+/verify-otp with role=seller)
-// -> upload KYC -> submit for approval. This endpoint handles the KYC + submit step.
-router.post(
-  "/register-seller",
-  requireAuth,
-  requireRole("seller"),
-  upload.single("kycDoc"),
-  (req: AuthedRequest, res) => {
-    const { businessName, docType, docNumber } = req.body;
-    if (!businessName || !docType || !docNumber) {
-      return res.status(400).json({ error: "businessName, docType, docNumber are required" });
-    }
-
-    const kycDetails = JSON.stringify({
-      docType,
-      docNumber,
-      docFileUrl: req.file ? `/uploads/kyc/${req.file.filename}` : null,
-    });
-
-    db.prepare(
-      `UPDATE sellers SET business_name = ?, kyc_details = ?, status = 'pending' WHERE user_id = ?`
-    ).run(businessName, kycDetails, req.auth!.userId);
-
-    const seller = db.prepare(`SELECT * FROM sellers WHERE user_id = ?`).get(req.auth!.userId);
-    res.json({ seller });
+router.post("/register-seller", requireAuth, requireRole("seller"), upload.single("kycDoc"), async (req: AuthedRequest, res) => {
+  const { businessName, docType, docNumber } = req.body;
+  if (!businessName || !docType || !docNumber) {
+    return res.status(400).json({ error: "businessName, docType, docNumber are required" });
   }
-);
-
-// ---------- GET /sellers/me ----------
-router.get("/me", requireAuth, requireRole("seller"), (req: AuthedRequest, res) => {
-  const seller = db.prepare(`SELECT * FROM sellers WHERE user_id = ?`).get(req.auth!.userId);
-  res.json({ seller });
+  let docFileUrl: string | null = null;
+  if (req.file) {
+    const blob = await put(`kyc/${req.auth!.userId}-${Date.now()}-${req.file.originalname}`, req.file.buffer, { access: "public" });
+    docFileUrl = blob.url;
+  }
+  const kycDetails = JSON.stringify({ docType, docNumber, docFileUrl });
+  await pool.query(`UPDATE sellers SET business_name = $1, kyc_details = $2, status = 'pending' WHERE user_id = $3`, [businessName, kycDetails, req.auth!.userId]);
+  const { rows } = await pool.query(`SELECT * FROM sellers WHERE user_id = $1`, [req.auth!.userId]);
+  res.json({ seller: rows[0] });
 });
 
-// ---------- GET /sellers/earnings (Earnings Dashboard: total sales, commission, net payout) ----------
-router.get("/earnings", requireAuth, requireRole("seller"), (req: AuthedRequest, res) => {
-  const rows = db
-    .prepare(
-      `SELECT o.* FROM orders o
-       JOIN products p ON p.id = o.product_id
-       WHERE p.seller_id = ? AND o.status != 'cancelled'`
-    )
-    .all(req.auth!.userId) as any[];
-
-  const totalSales = rows.reduce((sum, o) => sum + o.total_price, 0);
-  const totalCommission = rows.reduce((sum, o) => sum + o.commission_amount, 0);
-  const netPayout = rows.reduce((sum, o) => sum + o.seller_payout, 0);
-
-  res.json({
-    totalSales: round2(totalSales),
-    totalCommission: round2(totalCommission),
-    netPayout: round2(netPayout),
-    orderCount: rows.length,
-  });
+router.get("/me", requireAuth, requireRole("seller"), async (req: AuthedRequest, res) => {
+  const { rows } = await pool.query(`SELECT * FROM sellers WHERE user_id = $1`, [req.auth!.userId]);
+  res.json({ seller: rows[0] });
 });
 
-function round2(n: number) {
-  return Math.round(n * 100) / 100;
-}
+router.get("/earnings", requireAuth, requireRole("seller"), async (req: AuthedRequest, res) => {
+  const { rows } = await pool.query(`SELECT o.* FROM orders o JOIN products p ON p.id = o.product_id WHERE p.seller_id = $1 AND o.status != 'cancelled'`, [req.auth!.userId]);
+  const totalSales = rows.reduce((sum: number, o: any) => sum + Number(o.total_price), 0);
+  const totalCommission = rows.reduce((sum: number, o: any) => sum + Number(o.commission_amount), 0);
+  const netPayout = rows.reduce((sum: number, o: any) => sum + Number(o.seller_payout), 0);
+  res.json({ totalSales: round2(totalSales), totalCommission: round2(totalCommission), netPayout: round2(netPayout), orderCount: rows.length });
+});
+function round2(n: number) { return Math.round(n * 100) / 100; }
 
-// ---------- Admin: seller verification ----------
-
-// GET /admin/sellers/pending
-router.get("/admin/pending", requireAuth, requireRole("admin"), (_req, res) => {
-  const rows = db
-    .prepare(
-      `SELECT s.*, u.phone, u.name FROM sellers s JOIN users u ON u.id = s.user_id
-       WHERE s.status = 'pending' ORDER BY s.created_at ASC`
-    )
-    .all();
+router.get("/admin/pending", requireAuth, requireRole("admin"), async (_req, res) => {
+  const { rows } = await pool.query(`SELECT s.*, u.phone, u.name FROM sellers s JOIN users u ON u.id = s.user_id WHERE s.status = 'pending' ORDER BY s.created_at ASC`);
   res.json({ sellers: rows });
 });
-
-// GET /admin/sellers (all, for moderation view)
-router.get("/admin/all", requireAuth, requireRole("admin"), (_req, res) => {
-  const rows = db
-    .prepare(`SELECT s.*, u.phone, u.name FROM sellers s JOIN users u ON u.id = s.user_id ORDER BY s.created_at DESC`)
-    .all();
+router.get("/admin/all", requireAuth, requireRole("admin"), async (_req, res) => {
+  const { rows } = await pool.query(`SELECT s.*, u.phone, u.name FROM sellers s JOIN users u ON u.id = s.user_id ORDER BY s.created_at DESC`);
   res.json({ sellers: rows });
 });
-
-// POST /admin/sellers/:id/approve
-router.post("/admin/:id/approve", requireAuth, requireRole("admin"), (req: AuthedRequest, res) => {
-  const result = db.prepare(`UPDATE sellers SET status = 'approved' WHERE user_id = ?`).run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: "Seller not found" });
+router.post("/admin/:id/approve", requireAuth, requireRole("admin"), async (req: AuthedRequest, res) => {
+  const result = await pool.query(`UPDATE sellers SET status = 'approved' WHERE user_id = $1`, [req.params.id]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Seller not found" });
   res.json({ ok: true });
 });
-
-// POST /admin/sellers/:id/reject
-router.post("/admin/:id/reject", requireAuth, requireRole("admin"), (req: AuthedRequest, res) => {
-  const result = db.prepare(`UPDATE sellers SET status = 'rejected' WHERE user_id = ?`).run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: "Seller not found" });
+router.post("/admin/:id/reject", requireAuth, requireRole("admin"), async (req: AuthedRequest, res) => {
+  const result = await pool.query(`UPDATE sellers SET status = 'rejected' WHERE user_id = $1`, [req.params.id]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Seller not found" });
   res.json({ ok: true });
 });
-
-// POST /admin/sellers/:id/block  (manual override, PRD 4.3)
-router.post("/admin/:id/block", requireAuth, requireRole("admin"), (req: AuthedRequest, res) => {
-  const result = db.prepare(`UPDATE sellers SET status = 'blocked' WHERE user_id = ?`).run(req.params.id);
-  if (result.changes === 0) return res.status(404).json({ error: "Seller not found" });
+router.post("/admin/:id/block", requireAuth, requireRole("admin"), async (req: AuthedRequest, res) => {
+  const result = await pool.query(`UPDATE sellers SET status = 'blocked' WHERE user_id = $1`, [req.params.id]);
+  if (result.rowCount === 0) return res.status(404).json({ error: "Seller not found" });
   res.json({ ok: true });
 });
 
