@@ -1,3 +1,4 @@
+import "dotenv/config";
 import type { IncomingMessage, ServerResponse } from "http";
 import { app, ready } from "../src/app";
 
