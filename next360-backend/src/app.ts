@@ -29,3 +29,7 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
 });
 
 export const ready = initSchema();
+
+// Vercel's Express runtime discovers src/app.ts and requires a default app
+// export. Keep the named export for the API function handler as well.
+export default app;
