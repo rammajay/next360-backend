@@ -13,6 +13,8 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   phone TEXT UNIQUE NOT NULL,
+  email TEXT,
+  password_hash TEXT,
   name TEXT,
   role TEXT NOT NULL CHECK (role IN ('buyer','seller','admin')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -73,5 +75,8 @@ CREATE TABLE IF NOT EXISTS otp_codes (
 
 export async function initSchema() {
   await pool.query(SCHEMA);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users (email) WHERE email IS NOT NULL`);
   console.log("[db] schema ready (Postgres)");
 }
